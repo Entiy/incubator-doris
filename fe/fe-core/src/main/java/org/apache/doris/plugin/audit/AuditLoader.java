@@ -20,6 +20,7 @@ package org.apache.doris.plugin.audit;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.util.DigitalVersion;
 import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.plugin.AuditEvent;
 import org.apache.doris.plugin.AuditPlugin;
 import org.apache.doris.plugin.Plugin;
@@ -184,24 +185,29 @@ public class AuditLoader extends Plugin implements AuditPlugin {
                 || currentTime - lastLoadTimeAuditLog >= GlobalVariable.auditPluginMaxBatchInternalSec * 1000)) {
             // begin to load
             try {
-                String token = "";
-                try {
-                    // Acquire token from master
-                    token = Env.getCurrentEnv().getTokenManager().acquireToken();
-                } catch (Exception e) {
-                    LOG.warn("Failed to get auth token: {}", e);
-                    discardLogNum += auditLogNum;
-                    return;
+                while (true) {
+                    try {
+                        String  token = Env.getCurrentEnv().getTokenManager().acquireToken();
+                        AuditStreamLoader.LoadResponse response = streamLoader.loadBatch(auditLogBuffer, token);
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("audit loader response: {}", response);
+                        }
+                        return;
+                    } catch (Exception e) {
+                        LOG.warn("encounter exception when loading audit logs into audit table then retry", e);
+                        try {
+                            TimeUnit.SECONDS.sleep(10);
+                        } catch (InterruptedException ex) {
+                            throw new RuntimeException(ex);
+                        }
+                        if (exceedAuditDataSize()) {
+                            LOG.warn("encounter exception, discard {} audit logs", auditLogNum, e);
+                            discardLogNum += auditLogNum;
+                            MetricRepo.COUNTER_AUDIT_LOG_DISCARD_NUM.increase((long) auditLogNum);
+                            return;
+                        }
+                    }
                 }
-                AuditStreamLoader.LoadResponse response = streamLoader.loadBatch(auditLogBuffer, token);
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("audit loader response: {}", response);
-                }
-            } catch (Exception e) {
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("encounter exception when putting current audit batch, discard current batch", e);
-                }
-                discardLogNum += auditLogNum;
             } finally {
                 // make a new string builder to receive following events.
                 resetBatch(currentTime);
@@ -210,6 +216,16 @@ public class AuditLoader extends Plugin implements AuditPlugin {
                 }
             }
         }
+    }
+
+    private boolean exceedAuditDataSize() {
+        int size = 0;
+        for (AuditEvent event : auditEventQueue) {
+            StringBuilder sb = new StringBuilder();
+            fillLogBuffer(event, sb);
+            size += sb.length();
+        }
+        return size > 3 * GlobalVariable.auditPluginMaxBatchBytes;
     }
 
     private void resetBatch(long currentTime) {
@@ -232,12 +248,8 @@ public class AuditLoader extends Plugin implements AuditPlugin {
                     }
                     // process all audit logs
                     loadIfNecessary(false);
-                } catch (InterruptedException ie) {
-                    if (LOG.isDebugEnabled()) {
-                        LOG.debug("encounter exception when loading current audit batch", ie);
-                    }
                 } catch (Exception e) {
-                    LOG.error("run audit logger error:", e);
+                    LOG.error("encounter exception when loading current audit batch", e);
                 }
             }
         }
