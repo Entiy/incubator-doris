@@ -108,7 +108,7 @@ public class AuditStreamLoader {
         return response.toString();
     }
 
-    public LoadResponse loadBatch(StringBuilder sb, String clusterToken) {
+    public LoadResponse loadBatch(String data, String clusterToken) {
         String label = genLabel();
 
         HttpURLConnection feConn = null;
@@ -131,7 +131,7 @@ public class AuditStreamLoader {
             beConn = getConnection(location, label, clusterToken);
             // send data to be
             try (BufferedOutputStream bos = new BufferedOutputStream(beConn.getOutputStream())) {
-                bos.write(sb.toString().getBytes());
+                bos.write(data.getBytes());
             }
 
             // get respond

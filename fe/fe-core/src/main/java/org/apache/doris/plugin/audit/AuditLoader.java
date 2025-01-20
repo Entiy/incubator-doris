@@ -37,7 +37,9 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /*
  * This plugin will load audit log to specified doris table at specified interval
@@ -56,6 +58,7 @@ public class AuditLoader extends Plugin implements AuditPlugin {
     private BlockingQueue<AuditEvent> auditEventQueue;
     private AuditStreamLoader streamLoader;
     private Thread loadThread;
+    private AssistantOfLoadWorker assistantOfLoadWorker;
 
     private volatile boolean isClosed = false;
     private volatile boolean isInit = false;
@@ -88,6 +91,8 @@ public class AuditLoader extends Plugin implements AuditPlugin {
             this.streamLoader = new AuditStreamLoader();
             this.loadThread = new Thread(new LoadWorker(), "audit loader thread");
             this.loadThread.start();
+            this.assistantOfLoadWorker = new AssistantOfLoadWorker("audit assistant thread");
+            this.assistantOfLoadWorker.start();
 
             isInit = true;
         }
@@ -97,12 +102,15 @@ public class AuditLoader extends Plugin implements AuditPlugin {
     public void close() throws IOException {
         super.close();
         isClosed = true;
-        if (loadThread != null) {
-            try {
-                loadThread.join();
-            } catch (InterruptedException e) {
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("encounter exception when closing the audit loader", e);
+        Thread[] threads = {loadThread, assistantOfLoadWorker};
+        for (Thread thread : threads) {
+            if (thread != null) {
+                try {
+                    loadThread.join();
+                } catch (InterruptedException e) {
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("encounter exception when closing the audit loader", e);
+                    }
                 }
             }
         }
@@ -185,47 +193,23 @@ public class AuditLoader extends Plugin implements AuditPlugin {
                 || currentTime - lastLoadTimeAuditLog >= GlobalVariable.auditPluginMaxBatchInternalSec * 1000)) {
             // begin to load
             try {
-                while (true) {
-                    try {
-                        String  token = Env.getCurrentEnv().getTokenManager().acquireToken();
-                        AuditStreamLoader.LoadResponse response = streamLoader.loadBatch(auditLogBuffer, token);
-                        if (LOG.isDebugEnabled()) {
-                            LOG.debug("audit loader response: {}", response);
-                        }
-                        return;
-                    } catch (Exception e) {
-                        LOG.warn("encounter exception when loading audit logs into audit table then retry", e);
-                        try {
-                            TimeUnit.SECONDS.sleep(10);
-                        } catch (InterruptedException ex) {
-                            throw new RuntimeException(ex);
-                        }
-                        if (exceedAuditDataSize()) {
-                            LOG.warn("encounter exception, discard {} audit logs", auditLogNum, e);
-                            discardLogNum += auditLogNum;
-                            MetricRepo.COUNTER_AUDIT_LOG_DISCARD_NUM.increase((long) auditLogNum);
-                            return;
-                        }
-                    }
-                }
+                load(auditLogBuffer.toString());
+            } catch (Exception e) {
+                LOG.warn("encounter exception when loading audit logs into audit table", e);
+                assistantOfLoadWorker.addLoadFailAuditData(auditLogBuffer.toString(), auditLogNum);
             } finally {
                 // make a new string builder to receive following events.
                 resetBatch(currentTime);
-                if (discardLogNum > 0) {
-                    LOG.info("num of total discarded audit logs: {}", discardLogNum);
-                }
             }
         }
     }
 
-    private boolean exceedAuditDataSize() {
-        int size = 0;
-        for (AuditEvent event : auditEventQueue) {
-            StringBuilder sb = new StringBuilder();
-            fillLogBuffer(event, sb);
-            size += sb.length();
+    private void load(String data) throws Exception {
+        String token = Env.getCurrentEnv().getTokenManager().acquireToken();
+        AuditStreamLoader.LoadResponse response = streamLoader.loadBatch(data, token);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("audit loader response: {}", response);
         }
-        return size > 3 * GlobalVariable.auditPluginMaxBatchBytes;
     }
 
     private void resetBatch(long currentTime) {
@@ -251,6 +235,83 @@ public class AuditLoader extends Plugin implements AuditPlugin {
                 } catch (Exception e) {
                     LOG.error("encounter exception when loading current audit batch", e);
                 }
+            }
+        }
+    }
+
+    private class AssistantOfLoadWorker extends Thread {
+        private static final int MAX_RETRY_TIME_S = 600;
+        private static final int RETRY_INTERVAL_S = 5;
+
+        private final AtomicLong failedDataBytes = new AtomicLong(0);
+        private final ConcurrentLinkedDeque<Batch> failedDataQueue = new ConcurrentLinkedDeque<>();
+
+        public AssistantOfLoadWorker(String name) {
+            super(name);
+        }
+
+        public void addLoadFailAuditData(String data, int discardCount) {
+            Batch batch = new Batch(data, discardCount);
+            failedDataQueue.add(batch);
+            failedDataBytes.addAndGet(data.length());
+        }
+
+        @Override
+        public void run() {
+            while (!isClosed) {
+                try {
+                    processBatch();
+                } catch (Exception e) {
+                    LOG.error("Failed to process audit logs batch", e);
+                }
+            }
+        }
+
+        private void processBatch() {
+            Batch batch = failedDataQueue.poll();
+            if (batch == null) {
+                return;
+            }
+
+            try {
+                load(batch.data);
+                LOG.info("Successfully loaded previously failed audit log");
+            } catch (Exception e) {
+                handleLoadFailure(batch, e);
+            }
+        }
+
+        private void handleLoadFailure(Batch batch, Exception e)  {
+            if (shouldDiscardBatch(batch)) {
+                failedDataBytes.addAndGet(-batch.data.length());
+                discardLogNum += batch.discardCount;
+                MetricRepo.COUNTER_AUDIT_LOG_DISCARD_NUM.update(batch.discardCount);
+                LOG.warn("discarded {}/{} audit log", batch.discardCount, discardLogNum);
+                return;
+            }
+            failedDataQueue.addFirst(batch);
+            LOG.warn("Failed to load audit logs, will retry", e);
+            try {
+                TimeUnit.SECONDS.sleep(RETRY_INTERVAL_S);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        private boolean shouldDiscardBatch(Batch batch) {
+            return System.currentTimeMillis() - batch.timestamp > MAX_RETRY_TIME_S * 1000L
+                || failedDataBytes.get() > 3 * GlobalVariable.auditPluginMaxBatchBytes;
+        }
+
+        class Batch {
+            public String data;
+            public long discardCount;
+            public long timestamp;
+
+            public Batch(String data, int discardCount) {
+                this.data = data;
+                this.discardCount = discardCount;
+                this.timestamp = System.currentTimeMillis();
             }
         }
     }
