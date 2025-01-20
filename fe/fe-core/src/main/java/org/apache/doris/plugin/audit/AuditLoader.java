@@ -210,6 +210,10 @@ public class AuditLoader extends Plugin implements AuditPlugin {
         if (LOG.isDebugEnabled()) {
             LOG.debug("audit loader response: {}", response);
         }
+        LOG.info("audit loader response: {}", response);
+        if (response.status != 200) {
+            throw new Exception(response.respMsg);
+        }
     }
 
     private void resetBatch(long currentTime) {
