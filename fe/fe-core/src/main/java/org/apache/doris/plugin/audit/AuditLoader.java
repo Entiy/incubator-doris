@@ -18,6 +18,7 @@
 package org.apache.doris.plugin.audit;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.util.DigitalVersion;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.metric.MetricRepo;
@@ -210,9 +211,12 @@ public class AuditLoader extends Plugin implements AuditPlugin {
         if (LOG.isDebugEnabled()) {
             LOG.debug("audit loader response: {}", response);
         }
+        if (Config.mock_audit_load) {
+            throw new Exception(response.respContent);
+        }
         LOG.info("audit loader response: {}", response);
         if (response.status != 200) {
-            throw new Exception(response.respMsg);
+            throw new Exception(response.respContent);
         }
     }
 
